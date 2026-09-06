@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: the turn after an abort could rewrite the aborted child's session, silently losing the conversation** — `forceRotate` was set in the query's `.then`, which runs when the SDK consumer unwinds, not when pi acknowledges the abort. On Agent SDK 0.3.261 the next turn's `syncSharedSession` won that race by 13–17ms, took the preserved rebuild, and handed the dying child's own JSONL to the next query; the model then answered with no history. The abort handler now marks the session before the next turn can be dispatched. Guarded by `tests/int-abort-then-next-turn.mjs`.
+
 ## 0.9.3 — 2026-10-13
 
 - **Remove: compaction and branch-summary takeovers (#189)** — pi runs them natively; the bridge routes summary calls to its isolated path. Other compaction extensions should now work. Resolves #115. Thanks @sonSunnoi.

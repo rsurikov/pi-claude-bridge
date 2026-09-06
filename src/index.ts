@@ -2084,6 +2084,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	};
 	const onAbort = () => {
 		wasAborted = true;
+		// Mark here, not only in the completion handler below: that one runs when the
+		// SDK consumer unwinds, which can be after pi has acknowledged the abort and
+		// dispatched the next turn. The next sync would then still see a clean
+		// session and rewrite the JSONL this child is being killed out of.
+		const state = sessionStateFor(queryCtx.piSessionId);
+		if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
 		drainForAbort(abortCtx, promptStream);
 		requestAbort();
 	};
