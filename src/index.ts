@@ -1476,13 +1476,18 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
  *  Runs until the query ends. Per turn, the SDK yields stream_events (deltas), then
  *  an assistant message (completed blocks). On tool_use, the stream is ended by
  *  whichever path handles it first (processStreamEvent or processAssistantMessage),
- *  and the MCP handler blocks the generator until pi delivers the tool result. */
+ *  and the MCP handler blocks the generator until pi delivers the tool result.
+ *
+ *  `onResult` fires once the `result` is fully handled. The query's outcome is
+ *  known there, while the loop itself only exits once the SDK has torn the CLI
+ *  down — up to 2s later. */
 async function consumeQuery(
 	sdkQuery: ReturnType<typeof query>,
 	customToolNameToPi: Map<string, string>,
 	model: Model<any>,
-	wasAborted: () => boolean,
+	stopped: () => boolean,
 	queryCtx: QueryContext,
+	onResult?: (capturedSessionId: string | undefined) => void,
 ): Promise<{ capturedSessionId?: string }> {
 	let capturedSessionId: string | undefined;
 
@@ -1493,7 +1498,7 @@ async function consumeQuery(
 		// Code really emitted rather than ones we imagined.
 		const recordStreamPath = process.env.CLAUDE_BRIDGE_RECORD_STREAM;
 		if (recordStreamPath) appendFileSync(recordStreamPath, `${JSON.stringify(message)}\n`);
-		if (wasAborted()) break;
+		if (stopped()) break;
 		await reportHeldRateLimit(queryCtx, model);
 		// Everything below the currentPiStream guard is content, which there is
 		// nowhere to put once a turn has ended on a tool call. These three are not
@@ -1560,7 +1565,11 @@ async function consumeQuery(
 			}
 			continue;
 		}
-		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
+		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) {
+			// No turn to put content in, but a `result` still ends the query.
+			if (message.type === "result") onResult?.(capturedSessionId);
+			continue;
+		}
 
 		switch (message.type) {
 			case "stream_event":
@@ -1582,6 +1591,7 @@ async function consumeQuery(
 					queryCtx.currentPiStream?.push({ type: "text_delta", contentIndex: idx, delta: text, partial: queryCtx.turnOutput });
 					queryCtx.currentPiStream?.push({ type: "text_end", contentIndex: idx, content: text, partial: queryCtx.turnOutput });
 				}
+				onResult?.(capturedSessionId);
 				break;
 			}
 			case "system":
@@ -1604,7 +1614,7 @@ async function consumeQuery(
 	}
 
 	// DEBUG: trace when consumeQuery exits
-	debug(`consumeQuery: for-await loop exited, wasAborted=${wasAborted()}, capturedSessionId=${capturedSessionId?.slice(0, 8) ?? "none"}`);
+	debug(`consumeQuery: for-await loop exited, stopped=${stopped()}, capturedSessionId=${capturedSessionId?.slice(0, 8) ?? "none"}`);
 
 	return { capturedSessionId };
 }
@@ -2068,7 +2078,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
 	// 3. Start SDK query and claim it for this context
-	let wasAborted = false;
+	let settled = false;
 	const sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
@@ -2082,135 +2092,129 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		void sdkQuery.interrupt().catch(() => {});
 		try { sdkQuery.close(); } catch {}
 	};
-	const onAbort = () => {
-		wasAborted = true;
-		// Mark here, not only in the completion handler below: that one runs when the
-		// SDK consumer unwinds, which can be after pi has acknowledged the abort and
-		// dispatched the next turn. The next sync would then still see a clean
-		// session and rewrite the JSONL this child is being killed out of.
+
+	// Ends the query for pi as soon as its outcome is known — abort, `result`, or a
+	// failure — rather than when the SDK consumer unwinds. The SDK's teardown waits
+	// for the CLI to exit, up to 2s after the turn is over, and pi shows "Working"
+	// until this stream ends: every answer lingered for those 2s, an Esc took them
+	// to register, and one pressed in that window turned a finished answer into
+	// "aborted". pi's own providers end their stream this way too.
+	//
+	// Runs once. It also releases everything that routes a later provider call to
+	// this query, since that call can now arrive while the consumer is still
+	// unwinding: a lingering activeQuery would take the next prompt for a reentrant
+	// one, and a context left in activeQueryContexts would match that prompt's
+	// aborted tool results by their stale turnToolCallIds and hand it a stream
+	// nothing ends. A finish that throws releases nothing: the query stays this
+	// one's until a later path settles it on its own stream (the .catch below, for
+	// a throw while handling the result).
+	//
+	// A discarded query (discardRewrittenQuery) settles without touching anything:
+	// the query continuing the turn now owns this context, its stream and the
+	// session, and still runs on this call's signal, so an Esc reaches both.
+	const settle = (finish: () => void) => {
+		if (settled) return;
+		options?.signal?.removeEventListener("abort", onAbort);
+		if (abandonedQueries.has(sdkQuery)) {
+			settled = true;
+			debug("provider: discarded query settled, leaving session and stream to its replacement");
+			return;
+		}
+		finish();
+		settled = true;
+		if (queryCtx.activeQuery === sdkQuery) queryCtx.activeQuery = null;
+		queryCtx.releasePendingToolCalls("Query ended");
+		activeQueryContexts.delete(queryCtx);
+	};
+	const onAbort = () => settle(() => {
+		// Mark before pi can dispatch the next turn: until the rotation is set, the
+		// next sync still sees a clean session and rewrites the JSONL this child is
+		// being killed out of. Only this query's own mirror.
 		const state = sessionStateFor(queryCtx.piSessionId);
 		if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
+		debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
 		drainForAbort(abortCtx, promptStream);
 		requestAbort();
-	};
+		queryCtx.heldRateLimit = undefined;
+		if (queryCtx.turnOutput) {
+			queryCtx.turnOutput.stopReason = "aborted";
+			queryCtx.turnOutput.errorMessage = "Operation aborted";
+		}
+		const stream = queryCtx.currentPiStream;
+		stream?.push({ type: "error", reason: "aborted", error: queryCtx.turnOutput! });
+		markStreamComplete(stream);
+		stream?.end();
+		queryCtx.currentPiStream = null;
+	});
+	const finishQuery = (capturedSessionId: string | undefined) => settle(() => {
+		debug(`provider: query finished, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}`);
+
+		// --- Capture session ID ---
+		// This query's own mirror — a reentrant subagent completing does not
+		// reassign the parent's conversation to the child's CC file.
+		const state = sessionStateFor(queryCtx.piSessionId);
+		if (queryCtx.turnOutput?.stopReason === "error") {
+			// The SDK follows an error result by rejecting the query, and the .catch below
+			// has always dropped this session's mirror on that. Unchanged now that the turn
+			// ends here first; whether it should be dropped at all is issue #103.
+			setSessionStateFor(queryCtx.piSessionId, null);
+		} else if (syncResult.preserveSharedSession) {
+			if (capturedSessionId && capturedSessionId !== state?.sessionId) {
+				deleteSession(capturedSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+				debug(`provider: query done, deleted ephemeral session ${capturedSessionId.slice(0, 8)} to preserve shared session`);
+			}
+			debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session`);
+		} else {
+			const sessionId = capturedSessionId ?? state?.sessionId;
+			if (sessionId) {
+				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, state?.cursor ?? 0);
+				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
+				// A missed steer may precede the first mirror or arrive while this
+				// query is still able to complete. Preserve both rebuild signals.
+				setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild: queryCtx.missedSteer || state?.needsRebuild });
+			}
+		}
+
+		finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
+	});
 	if (options?.signal) {
 		if (options.signal.aborted) onAbort();
 		else options.signal.addEventListener("abort", onAbort, { once: true });
 	}
 
-	// Background consumer — runs until query ends
-	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
-		.then(async ({ capturedSessionId }) => {
-			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
-
-			// Discarded out from under: the query continuing the turn owns the context,
-			// the session and the stream. Capturing this one's session id here would put
-			// Claude Code back on the conversation it was discarded for.
-			if (abandonedQueries.has(sdkQuery)) {
-				debug("provider: discarded query completed, leaving session and stream to its replacement");
-				return;
-			}
-
-			// --- Abort detection in normal completion path ---
-			if (wasAborted || options?.signal?.aborted) {
-				// The killed subprocess may flush a late record into this session's
-				// JSONL — its own mirror's next sync must rebuild and rotate.
-				const state = sessionStateFor(queryCtx.piSessionId);
-				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
-				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
-				if (queryCtx.turnOutput) {
-					queryCtx.turnOutput.stopReason = "aborted";
-					queryCtx.turnOutput.errorMessage = "Operation aborted";
-				}
-				const stream = queryCtx.currentPiStream;
-				stream?.push({ type: "error", reason: "aborted", error: queryCtx.turnOutput! });
-				markStreamComplete(stream);
-				stream?.end();
-				queryCtx.currentPiStream = null;
-				queryCtx.heldRateLimit = undefined;
-				return;
-			}
-
-			// --- Capture session ID ---
-			// This query's own mirror — a reentrant subagent completing does not
-			// reassign the parent's conversation to the child's CC file.
-			if (syncResult.preserveSharedSession) {
-				const state = sessionStateFor(queryCtx.piSessionId);
-				if (capturedSessionId && capturedSessionId !== state?.sessionId) {
-					deleteSession(capturedSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
-					debug(`provider: query done, deleted ephemeral session ${capturedSessionId.slice(0, 8)} to preserve shared session`);
-				}
-				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session`);
-			} else {
-				const state = sessionStateFor(queryCtx.piSessionId);
-				const sessionId = capturedSessionId ?? state?.sessionId;
-				if (sessionId) {
-					const cursor = Math.max(context.messages.length, queryCtx.latestCursor, state?.cursor ?? 0);
-					debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-					// A missed steer may precede the first mirror or arrive while this
-					// query is still able to complete. Preserve both rebuild signals.
-					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild: queryCtx.missedSteer || state?.needsRebuild });
-				}
-			}
-
-			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
-				debug("provider: clearing activeQuery before final stream completion");
-				queryCtx.activeQuery = null;
-			}
-			finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
+	// Background consumer — runs until the SDK has torn the query down
+	consumeQuery(sdkQuery, customToolNameToPi, model, () => settled, queryCtx, finishQuery)
+		.then(({ capturedSessionId }) => {
+			debug(`provider: consumeQuery completed, settled=${settled}`);
+			finishQuery(capturedSessionId);
 		})
 		.catch((error) => {
-			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
-			if (abandonedQueries.has(sdkQuery)) {
-				debug("provider: discarded query ended in error, leaving session and stream to its replacement");
-				return;
-			}
-			if ((wasAborted || options?.signal?.aborted)) {
-				const state = sessionStateFor(queryCtx.piSessionId);
-				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
-				queryCtx.heldRateLimit = undefined;
-			} else {
+			debug(`provider: query error, model=${cliModel}, settled=${settled}, error=`, error);
+			settle(() => {
 				// Drop this session's mirror: its conversation is in an unknown
 				// state after the error. Other sessions' mirrors stay — one
 				// session's failure says nothing about another's conversation.
 				setSessionStateFor(queryCtx.piSessionId, null);
-			}
-			promptStream.fail(error instanceof Error ? error : new Error(String(error)));
-			if (queryCtx.turnOutput) {
-				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
-				// The SDK drops its copy of the result text if any message follows the error
-				// result, so prefer the cause consumeQuery recorded off the result itself.
-				queryCtx.turnOutput.errorMessage ??= error instanceof Error ? error.message : String(error);
-			}
-			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
-				queryCtx.releasePendingToolCalls("Query ended");
-				debug("provider: clearing activeQuery before error stream completion");
-				queryCtx.activeQuery = null;
-			}
-			const stream = queryCtx.currentPiStream;
-			stream?.push({ type: "error", reason: (queryCtx.turnOutput?.stopReason ?? "error") as "aborted" | "error", error: queryCtx.turnOutput! });
-			markStreamComplete(stream);
-			stream?.end();
-			queryCtx.currentPiStream = null;
+				promptStream.fail(error instanceof Error ? error : new Error(String(error)));
+				if (queryCtx.turnOutput) {
+					queryCtx.turnOutput.stopReason = "error";
+					// The SDK drops its copy of the result text if any message follows the error
+					// result, so prefer the cause consumeQuery recorded off the result itself.
+					queryCtx.turnOutput.errorMessage ??= error instanceof Error ? error.message : String(error);
+				}
+				const stream = queryCtx.currentPiStream;
+				stream?.push({ type: "error", reason: "error", error: queryCtx.turnOutput! });
+				markStreamComplete(stream);
+				stream?.end();
+				queryCtx.currentPiStream = null;
+			});
 		})
 		.finally(() => {
-			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
 			// Settle any ack still parked in the generator — the CLI is gone, so
 			// nothing will resume it. Clear the handle only if a later query
 			// hasn't already claimed the shared context.
 			promptStream.fail(new Error("query ended"));
 			if (queryCtx.promptStream === promptStream) queryCtx.promptStream = null;
-			// A later query claiming this context sets activeQuery to its own handle;
-			// null means the .then/.catch above cleared ours and nothing replaced it.
-			// Testing only for `=== sdkQuery` would never fire on the non-reentrant
-			// path, leaving the top-level context in the routing set forever — where a
-			// later orphaned tool result matches its stale turnToolCallIds and takes
-			// the delivery branch, returning a stream nothing ends.
-			if (queryCtx.activeQuery === sdkQuery || queryCtx.activeQuery === null) {
-				queryCtx.releasePendingToolCalls("Query ended");
-				queryCtx.activeQuery = null;
-				activeQueryContexts.delete(queryCtx);
-			}
 			sdkQuery.close();
 		});
 
