@@ -350,6 +350,48 @@ test("a resume started at result, while the CLI is still shutting down, keeps th
 	assert.deepEqual(orphans.map((record) => record.type), [], "the overlapping writes broke the parentUuid chain");
 });
 
+test("an interrupted CLI has recorded its turn by the time it answers, and the session resumes", { timeout: 180_000 }, async () => {
+	// After an abort the bridge resumes the interrupted session rather than rebuilding
+	// it, once the CLI has answered interrupt() with a result. That is only safe if the
+	// answer means the turn is on disk and nothing more enters the chain afterwards,
+	// and if CC resumes a transcript that ends in its own interrupted turn. Measured:
+	// result ~40ms after interrupt(), turn already written; later only `last-prompt`
+	// and `cost-state`.
+	async function* prompt() {
+		yield { type: "user", message: { role: "user", content: "Please remember: the word is MARIGOLD. Then write the numbers from 1 to 400, one per line." }, parent_tool_use_id: null };
+		await new Promise(() => {}); // parked, as the bridge's prompt stream is
+	}
+	const q = query({ prompt: prompt(), options: providerOptions({ maxTurns: 1, includePartialMessages: true }) });
+	let sessionId = null;
+	let deltas = 0;
+	let atAnswer = null;
+	const records = () => readFileSync(openSession({ sessionId, projectPath: CWD, claudeDir: process.env.CLAUDE_CONFIG_DIR }).jsonlPath, "utf8")
+		.trim().split("\n").map((line) => JSON.parse(line));
+	for await (const message of q) {
+		if (message.type === "system" && message.subtype === "init") sessionId = message.session_id;
+		if (message.type === "stream_event" && message.event?.type === "content_block_delta" && ++deltas === 5) void q.interrupt().catch(() => {});
+		if (message.type === "result") {
+			atAnswer = records();
+			q.close();
+			break;
+		}
+	}
+	assert.ok(atAnswer, "the interrupted CLI never answered with a result");
+	assert.match(JSON.stringify(atAnswer.at(-1).message?.content ?? ""), /interrupted/i,
+		`the interrupted turn was not recorded by the time the CLI answered: last record ${atAnswer.at(-1).type}`);
+
+	await new Promise((resolve) => setTimeout(resolve, 3000));
+	const later = records().slice(atAnswer.length).filter((record) => record.uuid || record.message);
+	assert.deepEqual(later.map((record) => record.type), [], "the interrupted CLI extended the conversation after answering");
+
+	const { result } = await collect(query({
+		prompt: "What word did I ask you to remember? Reply with just the word.",
+		options: providerOptions({ resume: sessionId, maxTurns: 1 }),
+	}));
+	assert.equal(result?.is_error, false, `resuming a session that ends in an interrupted turn failed: ${result?.result}`);
+	assert.match(result?.result ?? "", /marigold/i, `the resumed session lost the conversation: ${result?.result}`);
+});
+
 // --- The in-process MCP server ---
 
 test("the SDK treats our McpServer as an opaque endpoint — it only calls connect", { timeout: 120_000 }, async () => {

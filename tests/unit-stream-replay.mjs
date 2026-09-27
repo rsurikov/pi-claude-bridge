@@ -33,7 +33,7 @@ function fixture(name) {
 }
 
 /** Replays a fixture through the real consumeQuery, collecting the pi-side events. */
-async function replay(name, { toolNames = ["read"], stopped = () => false, onResult, extra = [] } = {}) {
+async function replay(name, { toolNames = ["read"], stopped = () => false, onResult, onDrained, extra = [] } = {}) {
 	const events = [];
 	const c = new QueryContext();
 	c.currentPiStream = { push: (e) => events.push(e), end: () => events.push({ type: "end" }) };
@@ -43,7 +43,7 @@ async function replay(name, { toolNames = ["read"], stopped = () => false, onRes
 
 	const messages = [...fixture(name), ...extra];
 	async function* stream() { for (const m of messages) yield m; }
-	const { capturedSessionId } = await __test.consumeQuery(stream(), customToolNameToPi, model, stopped, c, onResult && ((sessionId) => onResult(sessionId, [...events])));
+	const { capturedSessionId } = await __test.consumeQuery(stream(), customToolNameToPi, model, stopped, c, onResult && ((sessionId) => onResult(sessionId, [...events])), onDrained);
 	return { events, ctx: c, messages, capturedSessionId };
 }
 
@@ -139,5 +139,21 @@ describe("the result ends the query", () => {
 		});
 
 		assert.equal(calls, 1, "a message after the settle must not reach the query");
+	});
+
+	// An aborted query is settled before its CLI answers the interrupt. That answer is
+	// the one sign the CLI has recorded the interrupted turn, so it is reported — but it
+	// must not reach the query as a result.
+	it("reports a result that arrives after the query was stopped", async () => {
+		let results = 0;
+		let drained = 0;
+		await replay("text", {
+			stopped: () => true,
+			onResult: () => results++,
+			onDrained: () => drained++,
+		});
+
+		assert.equal(drained, 1);
+		assert.equal(results, 0);
 	});
 });

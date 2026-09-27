@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// The turn after an abort must not resume or rewrite-in-place the session the
-// killed Claude Code child was using.
+// The turn after an abort must not rewrite-in-place the session the killed Claude
+// Code child was using, nor resume it while the child may still be writing to it.
 //
 // `forceRotate` exists for exactly this: syncSharedSession preserves the session
 // UUID (deleteSession + createSession at the same path) unless there is "a
@@ -39,7 +39,7 @@ function timeline(debugLog) {
 		.map((l) => l.match(LINE))
 		.filter(Boolean)
 		.map((m) => [new Date(m[1]), m[2]])
-		.filter(([, text]) => /syncResult:|abort detected|consumeQuery completed/.test(text));
+		.filter(([, text]) => /syncResult:|abort detected|consumeQuery completed|interrupted CLI recorded/.test(text));
 }
 
 const render = (entries) => entries.map(([at, text]) => `  ${at.toISOString()} ${text}`).join("\n");
@@ -77,17 +77,23 @@ test("the sync after an abort rotates instead of reusing the aborted session", {
 
 		if (!answer.includes(token)) console.error(`NOTE: the conversation also lost its history — expected ${token}, got: ${answer.slice(0, 200)}`);
 
-		// clean-start is fine: nothing to race. reuse and preserved are not, and
-		// whether the abort was marked before or after says which one it was.
+		// clean-start is fine: nothing to race. Rewriting the session in place never
+		// is, and resuming it is only once the child has answered the interrupt — by
+		// then it has recorded its turn and writes nothing further into the
+		// conversation. Whether the abort was marked before or after the sync says
+		// which race it was.
 		const marking = since.find(([, text]) => text.includes("abort detected"));
 		const raced = marking && marking[0] > nextSync[0]
 			? `The abort was marked ${marking[0] - nextSync[0]}ms after that sync, so forceRotate could not apply to it.`
 			: "";
-		assert.doesNotMatch(
-			nextSync[1],
-			/path=reuse|preserved/,
-			`The turn after an abort resumed or rewrote the aborted child's session. ${raced}\n${render(since)}`,
-		);
+		assert.doesNotMatch(nextSync[1], /preserved/, `The turn after an abort rewrote the aborted child's session. ${raced}\n${render(since)}`);
+		if (/path=reuse/.test(nextSync[1])) {
+			const recorded = since.find(([, text]) => text.includes("interrupted CLI recorded"));
+			assert.ok(
+				/post-abort/.test(nextSync[1]) && recorded && recorded[0] <= nextSync[0],
+				`The turn after an abort resumed the aborted child's session before it had recorded its turn. ${raced}\n${render(since)}`,
+			);
+		}
 	} finally {
 		await harness.stop();
 	}
