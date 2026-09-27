@@ -1,4 +1,4 @@
-import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type ToolResultMessage, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
@@ -254,6 +254,41 @@ function setSessionStateFor(piSessionId: string | null | undefined, state: Sessi
 	else sharedSessions.set(sessionKey(piSessionId), state);
 }
 
+// An aborted query that was resuming its session's mirror. The rotation an abort
+// sets exists because the dying CLI may still be writing to that session; once it
+// has answered the interrupt, it has recorded the interrupted turn and writes nothing
+// further into the conversation, so the next turn can resume the session where it
+// stands instead of rebuilding it into a new one. A rebuild re-serializes the whole
+// history, so its prompt no longer matches the cached prefix: every Esc used to cost
+// a full re-cache of the conversation.
+//
+// `session` is the exact mirror state the abort marked; anything that replaces that
+// session's mirror since (compaction, tree navigation, a missed steer) leaves it
+// stale, and the next turn rotates as before. `seen` is how much of pi's messages the
+// aborted query had, in the same space as `context.messages`. `finished` holds the
+// tool calls that had already ended when the abort came: their results, errors
+// included, never reached the CLI, which recorded those calls as interrupted.
+// Keyed like the mirrors: one pi session's Esc says nothing about another's.
+interface InterruptedTurn {
+	session: SessionState;
+	seen: number;
+	finished: ReadonlySet<string>;
+	drained: boolean;
+}
+const interruptedTurns = new Map<string, InterruptedTurn>();
+
+// Tool calls pi has finished running since each session's current top-level query
+// started, as pi reports them (tool_execution_end fires per call, parallel
+// siblings included).
+const finishedToolCallsBySession = new Map<string, Set<string>>();
+
+function finishedToolCallsFor(piSessionId: string | null | undefined): Set<string> {
+	const key = sessionKey(piSessionId);
+	let calls = finishedToolCallsBySession.get(key);
+	if (!calls) finishedToolCallsBySession.set(key, (calls = new Set()));
+	return calls;
+}
+
 // pi replaced one of its sessions' history (compact, tree) rather than appending
 // to it. Read on the tool-result path — the one provider call that never reaches
 // syncSharedSession — so a query parked at a tool boundary is discarded rather
@@ -409,6 +444,32 @@ function turnStart(messages: Context["messages"]): number {
 	let i = messages.length;
 	while (i > 0 && messages[i - 1].role === "user") i--;
 	return i;
+}
+
+/** Whether everything after the first `seen` messages, up to the current user turn, is
+ *  the ending pi writes for an aborted turn: assistant messages Claude Code streamed,
+ *  and the errors of tools the abort cut off. A tool that finished on its own — before
+ *  the abort, successfully despite it, or failing for a reason of its own — has a
+ *  result the CLI never received; it recorded that call as interrupted, so a resume
+ *  would hide what the tool did. pi marks no error as the abort's, so the error has to
+ *  be one of the known cancellation messages in full; anything else rotates. */
+function onlyInterruptedTurnAfter(messages: Context["messages"], seen: number, finished: ReadonlySet<string>): boolean {
+	const after = nonSystemMessages(messages.slice(seen));
+	return after.slice(0, turnStart(after)).every((message) =>
+		message.role === "assistant" || (message.role === "toolResult" && message.isError
+			&& !finished.has(message.toolCallId) && isAbortError(toolResultText(message).trim())));
+}
+
+/** The text of a tool error the abort caused: pi's file tools' "Operation aborted",
+ *  Node's AbortError ("This operation was aborted"), a bare "aborted", or pi's bash,
+ *  which appends "Command aborted" to whatever output the command had printed. */
+function isAbortError(text: string): boolean {
+	return /^(operation aborted|aborted|(this|the) operation was aborted)\.?$/i.test(text)
+		|| /(^|\n\n)Command aborted$/.test(text);
+}
+
+function toolResultText(message: ToolResultMessage): string {
+	return message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
 }
 
 /** Extract the current user turn as a prompt string. Returns null if the last message is not a user message. */
@@ -764,6 +825,23 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	const history = nonSystemMessages(messages);
 	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
+	// REUSE after an abort: the interrupted CLI has recorded its turn, and pi added
+	// nothing since but that turn's own ending — its assistant messages and tool
+	// results, which the CLI holds in its own form. Anything else, or a CLI that has
+	// not answered the interrupt yet, falls through to the rotation the abort set.
+	const interruptedTurn = interruptedTurns.get(sessionKey(piSessionId));
+	if (
+		sharedSession && interruptedTurn?.drained && interruptedTurn.session === sharedSession
+		&& interruptedTurn.seen <= messages.length && onlyInterruptedTurnAfter(messages, interruptedTurn.seen, interruptedTurn.finished)
+	) {
+		const { sessionId } = sharedSession;
+		interruptedTurns.delete(sessionKey(piSessionId));
+		debug(`Case 3 post-abort: the interrupted CLI recorded its turn, resuming session ${sessionId.slice(0, 8)} past it, cursor ${sharedSession.cursor} → ${priorMessages.length}`);
+		setSessionStateFor(piSessionId, { sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined });
+		debug(`syncResult: path=reuse sessionId=${sessionId} cursor=${priorMessages.length} post-abort`);
+		return { sessionId };
+	}
+
 	// REUSE path
 	//
 	// Guard on priorMessages.length >= cursor: a shorter incoming context cannot
@@ -839,6 +917,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
 	setSessionStateFor(piSessionId, { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined });
+	interruptedTurns.delete(sessionKey(piSessionId));
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -862,8 +941,14 @@ export const __test = {
 	},
 	resetSharedSession(piSessionId?: string | null) {
 		// No id: full reset (the pre-map semantics — tests start from a blank slate).
-		if (piSessionId === undefined) sharedSessions.clear();
-		else setSessionStateFor(piSessionId, null);
+		if (piSessionId === undefined) {
+			sharedSessions.clear();
+			interruptedTurns.clear();
+			finishedToolCallsBySession.clear();
+		} else {
+			setSessionStateFor(piSessionId, null);
+			interruptedTurns.delete(sessionKey(piSessionId));
+		}
 		historyRewrittenBySession.clear();
 	},
 	markRebuildForSession,
@@ -881,6 +966,10 @@ export const __test = {
 	},
 	getSharedSession(piSessionId: string | null = null) {
 		return sessionStateFor(piSessionId);
+	},
+	setInterruptedTurn(turn: InterruptedTurn | null, piSessionId: string | null = null) {
+		if (turn) interruptedTurns.set(sessionKey(piSessionId), turn);
+		else interruptedTurns.delete(sessionKey(piSessionId));
 	},
 	setPiUI(ui: ExtensionUIContext | null) {
 		piUI = ui;
@@ -1480,7 +1569,8 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
  *
  *  `onResult` fires once the `result` is fully handled. The query's outcome is
  *  known there, while the loop itself only exits once the SDK has torn the CLI
- *  down — up to 2s later. */
+ *  down — up to 2s later. `onDrained` fires for a `result` that arrives after the
+ *  query was stopped: an interrupted CLI's answer to the interrupt. */
 async function consumeQuery(
 	sdkQuery: ReturnType<typeof query>,
 	customToolNameToPi: Map<string, string>,
@@ -1488,6 +1578,7 @@ async function consumeQuery(
 	stopped: () => boolean,
 	queryCtx: QueryContext,
 	onResult?: (capturedSessionId: string | undefined) => void,
+	onDrained?: () => void,
 ): Promise<{ capturedSessionId?: string }> {
 	let capturedSessionId: string | undefined;
 
@@ -1498,7 +1589,13 @@ async function consumeQuery(
 		// Code really emitted rather than ones we imagined.
 		const recordStreamPath = process.env.CLAUDE_BRIDGE_RECORD_STREAM;
 		if (recordStreamPath) appendFileSync(recordStreamPath, `${JSON.stringify(message)}\n`);
-		if (stopped()) break;
+		// A settled query's state may already belong to the next one, so nothing below
+		// runs for it. The loop still waits out the teardown, noting the result an
+		// interrupted CLI sends once it has recorded the turn.
+		if (stopped()) {
+			if (message.type === "result") onDrained?.();
+			continue;
+		}
 		await reportHeldRateLimit(queryCtx, model);
 		// Everything below the currentPiStream guard is content, which there is
 		// nowhere to put once a turn has ended on a tool call. These three are not
@@ -1701,6 +1798,10 @@ async function deliverToolResults(
 	}
 }
 
+/** How long an aborted CLI gets to answer the interrupt before it is closed anyway.
+ *  It answers in ~40ms; the cap only bounds a CLI that never does. */
+const ABORT_DRAIN_MS = 1000;
+
 /** Abort teardown for one query: settle everything that would otherwise be left
  *  awaiting a subprocess we are about to kill. The pump abandons iteration on
  *  abort, so an in-flight prompt-stream push would hang forever and take
@@ -1888,6 +1989,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	//    background subagents can run concurrently with the parent query.
 	const isReentrant = activeQuery;
 	const queryCtx = isReentrant ? new QueryContext() : ctx();
+	if (!isReentrant) finishedToolCallsFor(options?.sessionId).clear();
 	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${activeQueryContexts.size}`);
 
 	// Resolved first: an unaccountable system prompt fails this query before anything
@@ -2086,11 +2188,27 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// 4. Capture context for abort handling
 	const abortCtx = queryCtx;
 
-	const requestAbort = () => {
-		// interrupt() asks the CLI to stop gracefully; close() kills it immediately.
-		// Both are needed — interrupt alone lets the current API call finish.
-		void sdkQuery.interrupt().catch(() => {});
+	// interrupt() asks the CLI to stop: it cancels the API call, records the
+	// interrupted turn in its session and answers with a result, ~40ms later. close()
+	// then kills it — at once on that result (onDrained), or after ABORT_DRAIN_MS if
+	// the answer never comes.
+	let drainTimer: ReturnType<typeof setTimeout> | undefined;
+	const closeQuery = () => {
+		clearTimeout(drainTimer);
 		try { sdkQuery.close(); } catch {}
+	};
+	const requestAbort = () => {
+		void sdkQuery.interrupt().catch(() => {});
+		drainTimer = setTimeout(closeQuery, ABORT_DRAIN_MS);
+		drainTimer.unref?.();
+	};
+	let interrupted: InterruptedTurn | null = null;
+	const onDrained = () => {
+		if (interrupted) {
+			interrupted.drained = true;
+			debug(`provider: interrupted CLI recorded its turn in session ${interrupted.session.sessionId.slice(0, 8)}`);
+		}
+		closeQuery();
 	};
 
 	// Ends the query for pi as soon as its outcome is known — abort, `result`, or a
@@ -2131,8 +2249,24 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// next sync still sees a clean session and rewrites the JSONL this child is
 		// being killed out of. Only this query's own mirror.
 		const state = sessionStateFor(queryCtx.piSessionId);
-		if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
+		// A rebuild requested before the abort (a steer that never reached CC) must
+		// still happen; only the rotation the abort adds can be lifted.
+		const rebuildPending = state?.needsRebuild;
+		const marked = state ? { ...state, needsRebuild: true, forceRotate: true } : null;
+		if (marked) setSessionStateFor(queryCtx.piSessionId, marked);
 		debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
+		// The rotation can be lifted once this CLI answers the interrupt, provided it
+		// was resuming this session's mirror itself — a clean start or a subagent's
+		// throwaway session is not the one the next turn would resume.
+		if (marked && !rebuildPending && !isReentrant && resumeSessionId === marked.sessionId) {
+			interrupted = {
+				session: marked,
+				seen: Math.max(context.messages.length, queryCtx.latestCursor),
+				finished: new Set(finishedToolCallsFor(queryCtx.piSessionId)),
+				drained: false,
+			};
+			interruptedTurns.set(sessionKey(queryCtx.piSessionId), interrupted);
+		}
 		drainForAbort(abortCtx, promptStream);
 		requestAbort();
 		queryCtx.heldRateLimit = undefined;
@@ -2183,7 +2317,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// Background consumer — runs until the SDK has torn the query down
-	consumeQuery(sdkQuery, customToolNameToPi, model, () => settled, queryCtx, finishQuery)
+	consumeQuery(sdkQuery, customToolNameToPi, model, () => settled, queryCtx, finishQuery, onDrained)
 		.then(({ capturedSessionId }) => {
 			debug(`provider: consumeQuery completed, settled=${settled}`);
 			finishQuery(capturedSessionId);
@@ -2262,6 +2396,9 @@ async function promptAndWait(
 			// Provider already has a session — just resume from it
 			// Any missed messages from other providers were already handled by the provider's Case 4
 			resumeSessionId = askClaudeState.sessionId;
+			// This adds turns pi's history does not hold, so the session is no longer
+			// the one an abort left behind.
+			interruptedTurns.delete(sessionKey(askClaudeSessionId));
 		} else {
 			// No provider session yet — create one from pi's context
 			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
@@ -2459,6 +2596,8 @@ export default function (pi: ExtensionAPI) {
 		// top-level transition takes every mirror with it.
 		sharedSessions.clear();
 		historyRewrittenBySession.clear();
+		interruptedTurns.clear();
+		finishedToolCallsBySession.clear();
 
 		// Clear the global streamSimple if this instance registered it.
 		// This allows /reload to work — the old instance clears the flag so
@@ -2539,6 +2678,9 @@ export default function (pi: ExtensionAPI) {
 	// next before_agent_start — accepted: a stale skills list beats failing the turn.
 	pi.on("turn_start", (_event, ctx) => {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
+	});
+	pi.on("tool_execution_end", (event, ctx) => {
+		finishedToolCallsFor(ctx.sessionManager.getSessionId()).add(event.toolCallId);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		forgetSessionCwd(ctx.sessionManager.getSessionId());
