@@ -281,6 +281,75 @@ test("a streamed prompt keeps the query open past result until the input generat
 		`the SDK closed stdin on its own ${exitAt - resultAt}ms after result — a streamed prompt no longer parks the query, so steering is dead`);
 });
 
+test("after result, nothing more enters the transcript chain while the CLI shuts down", { timeout: 120_000 }, async () => {
+	// streamClaudeAgentSdk ends the turn for pi at `result`, while the CLI it ran
+	// in is still shutting down — the SDK gives it up to 2s. pi can resume the same
+	// session in that window, which is only safe if the dying CLI adds nothing to
+	// the conversation. Measured: one `cost-state` record, no uuid, ~64ms after
+	// result. (An aborted CLI does write — the interrupted turn — which is why the
+	// abort path rotates the session instead.)
+	let release;
+	const held = new Promise((resolve) => { release = resolve; });
+	async function* prompt() {
+		yield { type: "user", message: { role: "user", content: "Reply with just: OK" }, parent_tool_use_id: null };
+		await held;
+	}
+
+	const q = query({ prompt: prompt(), options: providerOptions({ maxTurns: 1 }) });
+	let sessionId = null;
+	let atResult = null;
+	const jsonlLines = () => readFileSync(openSession({ sessionId, projectPath: CWD, claudeDir: process.env.CLAUDE_CONFIG_DIR }).jsonlPath, "utf8").trim().split("\n");
+	for await (const message of q) {
+		if (message.type === "system" && message.subtype === "init") sessionId = message.session_id;
+		if (message.type === "result" && atResult === null) {
+			atResult = jsonlLines().length;
+			release();
+		}
+	}
+	assert.ok(atResult !== null, "no result message arrived");
+
+	const late = jsonlLines().slice(atResult).map((line) => JSON.parse(line));
+	const chained = late.filter((record) => record.uuid || record.message);
+	assert.deepEqual(chained.map((record) => record.type), [],
+		`the CLI extended the conversation after result (${late.map((r) => r.type).join(", ")}) — a turn that ends at result can race it`);
+});
+
+test("a resume started at result, while the CLI is still shutting down, keeps the conversation", { timeout: 180_000 }, async () => {
+	// The previous test pins what the dying CLI writes; this one runs the overlap
+	// itself. The bridge ends the prompt stream at result and pi can dispatch the
+	// next turn at once, so a second CLI --resumes the session while the first is
+	// still inside its teardown window.
+	let release;
+	const held = new Promise((resolve) => { release = resolve; });
+	async function* prompt() {
+		yield { type: "user", message: { role: "user", content: "Please remember: the word is MARIGOLD. Reply with just: OK" }, parent_tool_use_id: null };
+		await held;
+	}
+
+	let sessionId = null;
+	let resumed = null;
+	for await (const message of query({ prompt: prompt(), options: providerOptions({ maxTurns: 1 }) })) {
+		if (message.type === "system" && message.subtype === "init") sessionId = message.session_id;
+		if (message.type === "result" && resumed === null) {
+			release();
+			resumed = collect(query({
+				prompt: "What word did I ask you to remember? Reply with just the word.",
+				options: providerOptions({ resume: sessionId, maxTurns: 1 }),
+			}));
+		}
+	}
+	assert.ok(resumed, "no result message arrived");
+	const { result } = await resumed;
+	assert.match(result?.result ?? "", /marigold/i, `a resume during the shutdown lost the conversation: ${result?.result}`);
+
+	// Both CLIs wrote to one file; every record must still hang off the chain.
+	const records = readFileSync(openSession({ sessionId, projectPath: CWD, claudeDir: process.env.CLAUDE_CONFIG_DIR }).jsonlPath, "utf8")
+		.trim().split("\n").map((line) => JSON.parse(line));
+	const uuids = new Set(records.map((record) => record.uuid).filter(Boolean));
+	const orphans = records.filter((record) => record.parentUuid && !uuids.has(record.parentUuid));
+	assert.deepEqual(orphans.map((record) => record.type), [], "the overlapping writes broke the parentUuid chain");
+});
+
 // --- The in-process MCP server ---
 
 test("the SDK treats our McpServer as an opaque endpoint — it only calls connect", { timeout: 120_000 }, async () => {

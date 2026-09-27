@@ -33,7 +33,7 @@ function fixture(name) {
 }
 
 /** Replays a fixture through the real consumeQuery, collecting the pi-side events. */
-async function replay(name, { toolNames = ["read"] } = {}) {
+async function replay(name, { toolNames = ["read"], stopped = () => false, onResult, extra = [] } = {}) {
 	const events = [];
 	const c = new QueryContext();
 	c.currentPiStream = { push: (e) => events.push(e), end: () => events.push({ type: "end" }) };
@@ -41,9 +41,9 @@ async function replay(name, { toolNames = ["read"] } = {}) {
 	// The map the provider path builds from the served tool list: SDK name → pi name.
 	const customToolNameToPi = new Map(toolNames.map((n) => [`mcp__custom-tools__${n}`, n]));
 
-	const messages = fixture(name);
+	const messages = [...fixture(name), ...extra];
 	async function* stream() { for (const m of messages) yield m; }
-	const { capturedSessionId } = await __test.consumeQuery(stream(), customToolNameToPi, model, () => false, c);
+	const { capturedSessionId } = await __test.consumeQuery(stream(), customToolNameToPi, model, stopped, c, onResult && ((sessionId) => onResult(sessionId, [...events])));
 	return { events, ctx: c, messages, capturedSessionId };
 }
 
@@ -100,5 +100,44 @@ describe("replaying a recorded parallel-tool turn", () => {
 
 		assert.equal(blocks(ctx, "toolCall").length, 0, "unserved names must not reach pi");
 		assert.equal(ctx.turnSawToolCall, false);
+	});
+});
+
+// The provider ends the query for pi from onResult rather than when the loop exits:
+// the SDK only ends iteration once it has torn the CLI down, up to 2s after the
+// result, and pi shows "Working" for as long as the stream stays open.
+describe("the result ends the query", () => {
+	it("fires onResult once, after the answer is on the stream", async () => {
+		const calls = [];
+		const { events, capturedSessionId } = await replay("text", {
+			onResult: (sessionId, soFar) => calls.push({ sessionId, seen: soFar.map((e) => e.type) }),
+		});
+
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0].sessionId, capturedSessionId, "the session id must be known by then");
+		assert.ok(calls[0].seen.includes("text_end"), "the answer must be complete before the query ends");
+		assert.ok(!calls[0].seen.includes("end"), "ending the stream is the caller's job");
+	});
+
+	// A result that lands while pi runs a tool finds no stream open. The query is
+	// over all the same, and nothing else would release it for 2s.
+	it("fires onResult when the turn has no open stream", async () => {
+		let calls = 0;
+		const { ctx } = await replay("single-tool", { onResult: () => calls++ });
+
+		assert.equal(ctx.currentPiStream, null, "the turn ended on its tool call");
+		assert.equal(calls, 1);
+	});
+
+	it("stops consuming once the query is settled", async () => {
+		let settled = false;
+		let calls = 0;
+		await replay("text", {
+			stopped: () => settled,
+			onResult: () => { calls++; settled = true; },
+			extra: [{ type: "result", subtype: "success", is_error: false, result: "late" }],
+		});
+
+		assert.equal(calls, 1, "a message after the settle must not reach the query");
 	});
 });
