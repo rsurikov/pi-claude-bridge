@@ -37,7 +37,7 @@ const PI_DIST = fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding
  *  branch-summarization miss, and a filename-only inventory would wave it through.
  *  A changed count is not automatically a bug; it means read the diff and re-decide. */
 const HANDLED = {
-	"agent-session.js": { mentions: 2, why: "hand-offs: branch summary into generateBranchSummary, /bug into generateBugReportSummary — both via agent.streamFunction" },
+	"agent-session.js": { mentions: [2, 5], why: "hand-offs: branch summary into generateBranchSummary, /bug into generateBugReportSummary — both via agent.streamFunction. Pi 1.5.0 adds 3 mentions in markRuntimeStreamFunction (#11520): a WeakMap marker that keeps summary auth on the stored login, not a call" },
 	"sdk.js": { mentions: 2, why: "constructs the agent, does not summarize" },
 	"bug-report.js": { mentions: 1, why: "/bug summarization via completeSummarization (cacheRetention: none) — routed to the isolated path from streamClaudeAgentSdk (like compaction and branch summaries)" },
 	"compaction/compaction.js": { mentions: 13, why: "native completeSummarization -> provider cacheRetention:none -> isolatedStreamFn" },
@@ -78,8 +78,8 @@ describe("pi streamFn consumers", () => {
 		const missing = Object.keys(HANDLED).filter((rel) => !found.has(rel));
 		assert.deepEqual(missing, [], `these no longer consume streamFn — update the summary inventory: ${missing.join(", ")}`);
 
-		const drifted = [...found].filter(([rel, n]) => HANDLED[rel].mentions !== n)
-			.map(([rel, n]) => `${rel}: ${HANDLED[rel].mentions} -> ${n}`);
+		const drifted = [...found].filter(([rel, n]) => ![HANDLED[rel].mentions].flat().includes(n))
+			.map(([rel, n]) => `${rel}: ${[HANDLED[rel].mentions].flat().join(" or ")} -> ${n}`);
 		assert.deepEqual(
 			drifted,
 			[],

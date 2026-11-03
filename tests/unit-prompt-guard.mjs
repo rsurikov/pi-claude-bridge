@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { PI_PREAMBLE, projectPromptCapture, PromptCaptures } from "../src/prompt-capture.js";
+import { PI_PREAMBLE, PI_PREAMBLES, projectPromptCapture, PromptCaptures } from "../src/prompt-capture.js";
 
 const PI_SYSTEM_PROMPT = fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js", import.meta.url));
 
@@ -77,6 +77,20 @@ describe("prompt guard", () => {
 		}
 	});
 
+	it("throws on every known form of pi's preamble", () => {
+		for (const preamble of PI_PREAMBLES) {
+			const captures = new PromptCaptures();
+			captures.record(preamble, capture({ custom: `${preamble}, a coding agent harness.` }), "before_agent_start");
+			const found = captures.resolve(preamble);
+			assert.ok(found);
+			assert.throws(() => projectPromptCapture(found, { skillReadTool: "none" }), (error) => {
+				assert.ok(error instanceof Error);
+				assert.ok(error.message.includes(`pi's preamble ("${preamble}")`));
+				return true;
+			});
+		}
+	});
+
 	it("ignores a mid-line mention of pi's preamble", () => {
 		const captures = new PromptCaptures();
 		const custom = `note: ${PI_PREAMBLE}, allegedly`;
@@ -95,8 +109,8 @@ describe("prompt guard", () => {
 		const { buildSystemPrompt } = await import(PI_SYSTEM_PROMPT);
 		const harness = buildSystemPrompt({ cwd: "/tmp" });
 		assert.ok(
-			harness.includes(PI_PREAMBLE),
-			"pi reworded its preamble, so the harness guard matches nothing; update PI_PREAMBLE in src/prompt-capture.ts",
+			PI_PREAMBLES.some((preamble) => harness.includes(preamble)),
+			"pi reworded its preamble, so the harness guard matches nothing; add the new form to PI_PREAMBLES in src/prompt-capture.ts",
 		);
 		for (const trigger of ["docs/custom-provider.md", "docs/packages.md"]) {
 			assert.ok(
