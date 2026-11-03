@@ -3,6 +3,7 @@
 ## UNRELEASED
 
 - **Fix: the turn ends for pi at its outcome, not when Claude Code exits** — pi got a finished answer, and an Esc, only after the SDK's teardown waited for the CLI to exit: every answer held "Working" for ~2.1s and every Esc took ~2s to register. The turn is now handed back at the `result` or the abort; the session state is committed in memory at that moment, the next query still waits for the child's exit before it reads the session, and the pointer is saved after the exit as before. A failed save is still fatal, but no longer turns an answer pi already has into an error.
+- **Fix: the harness guard matched nothing on pi 1.5.0** — pi 1.5.0 reworded its preamble to "You are a coding assistant running inside pi", so a prompt carrying pi's harness in a forwarded part was sent instead of refused. `PI_PREAMBLES` holds both forms and the guard checks each; the pin test in `tests/unit-prompt-guard.mjs` now accepts either form in the installed pi's rendered prompt. The `streamFn` inventory accepts pi 1.5.0's three new mentions in `agent-session.js` (`markRuntimeStreamFunction`, #11520 — a marker, not a call).
 
 ## 0.11.0 — 2026-11-06
 
