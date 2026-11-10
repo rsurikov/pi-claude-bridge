@@ -1340,13 +1340,18 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
  *  Runs until the query ends. Per turn, the SDK yields stream_events (deltas), then
  *  an assistant message (completed blocks). On tool_use, the stream is ended by
  *  whichever path handles it first (processStreamEvent or processAssistantMessage),
- *  and the MCP handler blocks the generator until pi delivers the tool result. */
+ *  and the MCP handler blocks the generator until pi delivers the tool result.
+ *
+ *  `onResult` fires once a successful `result` that ends the query is handled:
+ *  the outcome is known there, while the loop only exits after the SDK has torn
+ *  the CLI down, up to 2s later. */
 async function consumeQuery(
 	sdkQuery: ReturnType<typeof query>,
 	customToolNameToPi: Map<string, string>,
 	model: Model<any>,
 	wasAborted: () => boolean,
 	queryCtx: QueryContext,
+	onResult?: (capturedSessionId: string | undefined) => void,
 ): Promise<{ capturedSessionId?: string; failure?: Error }> {
 	const { traceQueryId } = queryCtx;
 	let capturedSessionId: string | undefined;
@@ -1449,7 +1454,12 @@ async function consumeQuery(
 			capturedSessionId = message.session_id;
 			traceEvent("query-init", { queryId: traceQueryId, ccSession: capturedSessionId, claudeCodeVersion: message.claude_code_version });
 		}
-		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
+		// A successful result with no steer left to run is the end of the query.
+		const endsQuery = message.type === "result" && resultError === undefined && queryCtx.pendingSteerUuids.size === 0;
+		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) {
+			if (endsQuery) onResult?.(capturedSessionId);
+			continue;
+		}
 
 		switch (message.type) {
 			case "stream_event":
@@ -1480,6 +1490,7 @@ async function consumeQuery(
 				debug("consumeQuery: unhandled SDK message type", message.type);
 				break;
 		}
+		if (endsQuery) onResult?.(capturedSessionId);
 	}
 
 	// DEBUG: trace when consumeQuery exits
@@ -1998,10 +2009,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// A replayed uuid can precede its record on disk, so a pointer saved before
 		// exit could outlive a crash naming records that never land. Save once per
 		// snapshot, after the child exits, and only while it is still the current one.
+		let exitLogged = false;
 		const persistRecording = async () => {
 			sdkQuery.close();
 			childProcess.close();
 			await childProcess.exited;
+			// pi may have the turn long before this (handBackAtResult). Once per query.
+			if (!exitLogged) debug(`provider: Claude Code exited ${sessionTag(piSessionId)}`);
+			exitLogged = true;
 			const state = unsaved;
 			unsaved = null;
 			if (state && sharedSessions.get(piSessionId!) === state) saveSessionState(piSessionId!, state);
@@ -2021,8 +2036,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			childProcess.close();
 		};
 		queryCtx.stopProcess = requestAbort;
+		// pi already has this query's outcome: the turn was ended at its `result` or at
+		// the abort, before the SDK finished tearing the CLI down. pi shows "Working"
+		// until its stream ends, and the SDK's teardown waits up to 2s for the CLI to
+		// exit, so every answer lingered for those 2s and an Esc took them to register.
+		// The next query waits for this child's exit before it reads the session
+		// (waitForSessionWriter), and memory is committed before the hand-back.
+		let handedBack = false;
 		const onAbort = () => {
-			if (wasAborted) return;
+			if (wasAborted || handedBack) return;
 			wasAborted = true;
 			// The final snapshot for an aborted query; a failed commit still tears it
 			// down, then surfaces.
@@ -2033,12 +2055,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				traceEvent("query-abort", { queryId: traceQueryId });
 				drainForAbort(abortCtx, promptStream);
 				requestAbort();
+				failStream(new Error("Operation aborted"));
 			}
 		};
-		if (options?.signal) {
-			if (options.signal.aborted) onAbort();
-			else options.signal.addEventListener("abort", onAbort, { once: true });
-		}
 		// A later run continuing this query from a tool result brings its own signal;
 		// only the latest one is bound, and it is unbound when the query ends. Its abort
 		// counts only while that run's stream is live: hosts that abort each request's
@@ -2060,6 +2079,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 		// Ends the live pi stream with a query failure.
 		const failStream = (error: unknown) => {
+			if (handedBack) {
+				debug(`provider: query failed after pi had its outcome: ${errorMessage(error)}`);
+				return;
+			}
+			handedBack = true;
 			queryCtx.activeQuery = null;
 			activeQueryContexts.delete(queryCtx);
 			traceEvent("query-end", { queryId: traceQueryId, outcome: wasAborted ? "aborted" : "error", error: errorMessage(error) });
@@ -2078,8 +2102,33 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			finally { failStream(error); }
 		};
 
+		// Bound once failStream exists: an already-aborted signal ends the stream at once.
+		if (options?.signal) {
+			if (options.signal.aborted) onAbort();
+			else options.signal.addEventListener("abort", onAbort, { once: true });
+		}
+
+		// The query ended in success: hand pi the turn now. The save waits for the
+		// child's exit below; a failure there is still fatal, but the turn is already
+		// answered. A wrong session id is left to the completion below, which fails
+		// the turn and commits nothing.
+		const handBackAtResult = (capturedSessionId: string | undefined) => {
+			if (handedBack || wasAborted || queryCtx.discarded) return;
+			if (capturedSessionId && capturedSessionId !== syncResult.targetSessionId) return;
+			handedBack = true;
+			// An abort from here on would turn a finished answer into "aborted".
+			options?.signal?.removeEventListener("abort", onAbort);
+			unbindRunSignal();
+			if (queryCtx.currentPiStream) recordAssistantEmission(queryCtx);
+			commitRecording(false);
+			queryCtx.activeQuery = null;
+			activeQueryContexts.delete(queryCtx);
+			finalizeCurrentStream(queryCtx);
+			traceEvent("query-end", { queryId: traceQueryId, outcome: "complete", ccSession: syncResult.targetSessionId });
+		};
+
 		// Background consumer — its recording and CAS token belong to this query.
-		void consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
+		void consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx, handBackAtResult)
 			.then(async ({ capturedSessionId, failure }) => {
 				if (queryCtx.discarded) return;
 				if (capturedSessionId && capturedSessionId !== syncResult.targetSessionId) {
@@ -2089,16 +2138,26 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					throw error;
 				}
 				if (failure) return failQuery(failure);
-				if (wasAborted || options?.signal?.aborted) return failQuery(new Error("Operation aborted"));
-				if (queryCtx.currentPiStream) recordAssistantEmission(queryCtx);
-				commitRecording(!queryCtx.sawResult);
-				// Completion waits for the save, so a failed one ends the turn with it.
+				// After a hand-back at the result, a later abort of the run's signal is the
+				// host's, not the user's: the answer stands.
+				if (wasAborted || (!handedBack && options?.signal?.aborted)) return failQuery(new Error("Operation aborted"));
+				const wasHandedBack = handedBack;
+				// Committed at the hand-back already. A second commit would replace the state
+				// a next query may have taken as its CAS token, dropping that query's commit.
+				if (!wasHandedBack) {
+					if (queryCtx.currentPiStream) recordAssistantEmission(queryCtx);
+					commitRecording(!queryCtx.sawResult);
+				}
+				// The save follows the child's exit. A failed one ends the turn with it unless
+				// pi already has the answer (handBackAtResult); it is fatal either way.
 				try { await persistRecording(); }
 				catch (error) {
 					failStream(error);
 					throw error;
 				}
 				if (wasAborted) return failQuery(new Error("Operation aborted"));
+				if (wasHandedBack) return;
+				handedBack = true;
 				queryCtx.activeQuery = null;
 				activeQueryContexts.delete(queryCtx);
 				finalizeCurrentStream(queryCtx);
