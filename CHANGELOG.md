@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: the turn ends for pi at its outcome, not when Claude Code exits** — pi got a finished answer, and an Esc, only after the SDK's teardown waited for the CLI to exit: every answer held "Working" for ~2.1s and every Esc took ~2s to register. The turn is now handed back at the `result` or the abort; the session state is committed in memory at that moment, the next query still waits for the child's exit before it reads the session, and the pointer is saved after the exit as before. A failed save is still fatal, but no longer turns an answer pi already has into an error.
+
 ## 0.12.0 — 2026-11-10
 
 - **Add: Claude Fable 5.2 with 1M context** — Agent SDK bumped to 0.3.321 (Claude Code 2.1.321), which knows Fable 5.2; AskClaude's too.

@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { digestMessages } from "../src/message-digests.js";
+import { loadSessionState } from "../src/session-store.js";
 const mod = await import("../src/index.js");
 const { __test } = mod;
 const handlers = {};
@@ -82,6 +83,11 @@ it("native Claude Code accepts import, restart fork and prefix-write launches", 
 	const saved = __test.getSharedSession("pi-native");
 	assert.deepEqual(saved.digests, digestMessages([...prior, user("second"), second]), "CC's replay acknowledged the prompt");
 	assert.equal(saved.dirtyTail, false);
+	// The turn is handed back at its result; the pointer is saved once the CLI exits.
+	for (const deadline = Date.now() + 10_000; loadSessionState("pi-native", () => {})?.ccSessionId !== saved.ccSessionId;) {
+		assert.ok(Date.now() < deadline, "the pointer was never saved");
+		await new Promise((r) => setTimeout(r, 50));
+	}
 	__test.forgetSessionMemory();
 	const third = await turn([...prior, user("second"), second, user("third")]);
 	assert.equal(launches[1].forkSession, true, "a restart forks the persisted pointer");

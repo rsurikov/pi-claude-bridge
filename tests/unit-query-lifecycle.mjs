@@ -27,6 +27,8 @@ const sessionsDir = () => join(process.env.PI_CODING_AGENT_DIR, "claude-bridge",
 const persisted = (id = "pi") => loadSessionState(id, assert.fail);
 const stored = (state) => ({ ...state, dirtyTail: true });
 const tick = () => new Promise(setImmediate);
+// A turn is handed back at its result; the pointer is saved after the child exits.
+const flushed = async () => { await Promise.all(calls.map((c) => c.exited)); await tick(); };
 let scripts, calls;
 
 beforeEach(() => {
@@ -81,6 +83,13 @@ function fakeQuery({ options, prompt }) {
 		entry.pulled = true;
 		// CC pulled the prompt from stdin, then dies booting: no record, no replay.
 		if (script.boot) { await parked; return; }
+		// A turn still streaming when it is aborted.
+		if (script.stall) {
+			record("user", initial.message.content, initial.uuid);
+			yield { type: "system", subtype: "init", session_id: id };
+			await parked;
+			return;
+		}
 		record("user", initial.message.content, initial.uuid);
 		if (!script.preInit) yield { type: "system", subtype: "init", session_id: id };
 		if (!script.preInit && input) yield { type: "user", isReplay: true, parent_tool_use_id: null, uuid: initial.uuid, session_id: id, message: initial.message };
@@ -95,9 +104,16 @@ function fakeQuery({ options, prompt }) {
 			yield { type: "assistant", parent_tool_use_id: null, uuid: value.uuid, message: { id: `answer-${id}`, model: model.id, content: value.message.content } };
 		}
 		yield { type: "result", subtype: "success", is_error: Boolean(script.error), result: script.error ?? "answer", session_id: id };
+		// The SDK ends iteration only after its teardown waits for the CLI to exit.
+		if (script.teardown) await new Promise((r) => setTimeout(r, script.teardown));
 	})();
 	gen.interrupt = async () => {};
-	gen.close = () => { stopped = true; release(); if (!child.killed) child.kill("SIGTERM"); };
+	gen.close = () => {
+		stopped = true;
+		if (!child.killed) child.kill("SIGTERM");
+		if (script.teardown) setTimeout(release, script.teardown);
+		else release();
+	};
 	return gen;
 }
 afterEach(async () => {
@@ -360,6 +376,7 @@ it("a restart reloads the persisted pointer dirty and forks at its last valid cu
 	const ask = user("warm");
 	scripts.push({});
 	const answer = await call([ask]).result();
+	await flushed();
 	const saved = __test.getSharedSession("pi");
 	await calls[0].exited;
 	__test.forgetSessionMemory();
@@ -368,6 +385,7 @@ it("a restart reloads the persisted pointer dirty and forks at its last valid cu
 	assert.deepEqual(loaded, { ...saved, dirtyTail: true });
 	scripts.push({});
 	await call([ask, answer, user("next")]).result();
+	await flushed();
 	assert.equal(calls[1].options.forkSession, true);
 	assert.equal(calls[1].options.resume, saved.ccSessionId);
 	assert.equal(calls[1].options.resumeSessionAt, saved.uuids.at(-1));
@@ -380,11 +398,13 @@ it("a restart on another model imports pi's history instead of reusing the point
 	const ask = user("warm");
 	scripts.push({});
 	const answer = await call([ask]).result();
+	await flushed();
 	const saved = persisted();
 	await calls[0].exited;
 	__test.forgetSessionMemory();
 	scripts.push({});
 	await call([ask, answer, user("next")], undefined, "pi", other).result();
+	await flushed();
 	assert.equal(calls[1].options.forkSession, undefined);
 	assert.equal(calls[1].options.sessionId, undefined);
 	assert.notEqual(calls[1].options.resume, saved.ccSessionId);
@@ -410,6 +430,7 @@ it("an invalid persisted file is rejected, logged, and treated as no state", asy
 	const ask = user("warm");
 	scripts.push({});
 	const answer = await call([ask]).result();
+	await flushed();
 	await calls[0].exited;
 	const [file] = readdirSync(sessionsDir());
 	writeFileSync(join(sessionsDir(), file), JSON.stringify({ ...JSON.parse(readFileSync(join(sessionsDir(), file), "utf8")), version: 2 }));
@@ -418,6 +439,7 @@ it("an invalid persisted file is rejected, logged, and treated as no state", asy
 	assert.match(readFileSync(diagLogPath(), "utf8"), /session_state_rejected.*unsupported version/);
 	scripts.push({});
 	await call([ask, answer, user("next")]).result();
+	await flushed();
 	assert.equal(calls[1].options.forkSession, undefined);
 	assert.equal(persisted().ccSessionId, calls[1].options.resume);
 });
@@ -446,6 +468,7 @@ it("an unattributed query never writes provider state", async () => {
 it("switching pi sessions retains every other session's state", async () => {
 	scripts.push({});
 	await call([user("warm")]).result();
+	await flushed();
 	const saved = __test.getSharedSession("pi");
 	for (const reason of ["new", "resume", "fork"]) {
 		for (const fn of handlers.session_start) fn({ reason }, { cwd: process.cwd(), sessionManager: { getSessionId: () => `other-${reason}` } });
@@ -458,6 +481,7 @@ it("a pi fork or clone forks its parent's Claude Code session instead of importi
 	const ask = user("warm");
 	scripts.push({});
 	const answer = await call([ask]).result();
+	await flushed();
 	const parent = __test.getSharedSession("pi");
 	const parentFile = join(root, "parent.jsonl");
 	writeFileSync(parentFile, JSON.stringify({ type: "session", version: 3, id: "pi", timestamp: "", cwd: root }) + "\n");
@@ -465,6 +489,7 @@ it("a pi fork or clone forks its parent's Claude Code session instead of importi
 	assert.equal(readdirSync(sessionsDir()).length, 1, "the inherited copy is not saved before its own turn");
 	scripts.push({});
 	await call([ask, answer, user("next")], undefined, "pi-clone").result();
+	await flushed();
 	assert.equal(calls[1].options.forkSession, true);
 	assert.equal(calls[1].options.resume, parent.ccSessionId);
 	assert.equal(calls[1].options.resumeSessionAt, parent.uuids.at(-1));
@@ -553,14 +578,14 @@ async function runFatalTurn({ before = "", sessionId }) {
 	return { result: JSON.parse(lines[0]), survived: lines.includes("survived"), code, stderr };
 }
 
-it("a failed state save ends the turn with that error and is fatal, never retried as a query failure", async () => {
+it("a failed state save is fatal, never retried as a query failure; the answer pi already has stands", async () => {
 	const { result, survived, code, stderr } = await runFatalTurn({
 		// Load the (empty) state first, then put a directory where the save will write.
 		before: `mod.__test.getSharedSession("pi"); mkdirSync(join(file, "occupied"), { recursive: true });`,
 		sessionId: "options.sessionId",
 	});
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage, /EISDIR/);
+	// The turn is handed back at its result; the save follows the child's exit.
+	assert.equal(result.stopReason, "stop");
 	assert.notEqual(code, 0, "the failed save is not swallowed");
 	assert.ok(!survived);
 	assert.match(stderr, /EISDIR/);
@@ -575,4 +600,52 @@ it("an unexpected session id ends the turn, commits nothing, and is fatal", asyn
 	assert.notEqual(code, 0, "the protocol violation is not swallowed");
 	assert.ok(!survived);
 	assert.match(stderr, /unexpected session wrong-session/);
+});
+
+it("a finished answer is handed back at its result, before the SDK tears the CLI down", { timeout: 5000 }, async () => {
+	const ask = user("warm");
+	scripts.push({ teardown: 400 });
+	const started = Date.now();
+	const answer = await call([ask]).result();
+	assert.equal(answer.stopReason, "stop");
+	assert.ok(Date.now() - started < 300, `handed back after ${Date.now() - started}ms`);
+	const state = __test.getSharedSession("pi");
+	assert.deepEqual(state.digests, digestMessages([ask, answer]), "memory is committed at the hand-back");
+	assert.equal(state.dirtyTail, false);
+	assert.equal(persisted(), null, "the pointer waits for the child's exit");
+	scripts.push({});
+	const next = call([ask, answer, user("next")]);
+	await tick();
+	assert.equal(calls.length, 1, "the next query waits for the finishing child to exit");
+	await next.result();
+	assert.equal(calls.length, 2);
+	assert.equal(calls[1].options.resume, state.ccSessionId, "the next turn resumes the handed-back session");
+	await flushed();
+	assert.equal(persisted().ccSessionId, state.ccSessionId);
+});
+
+it("an abort hands the turn back at once, before the SDK tears the CLI down", { timeout: 5000 }, async () => {
+	const controller = new AbortController();
+	scripts.push({ stall: true, teardown: 400 });
+	const stream = call([user("long answer")], controller.signal);
+	while (!calls[0]?.pulled) await tick();
+	const abortedAt = Date.now();
+	controller.abort();
+	const output = await stream.result();
+	assert.equal(output.stopReason, "aborted");
+	assert.ok(Date.now() - abortedAt < 200, `handed back ${Date.now() - abortedAt}ms after the abort`);
+	await flushed();
+});
+
+it("the run's signal aborted after the hand-back leaves the answer and its state clean", { timeout: 5000 }, async () => {
+	const ask = user("warm"), controller = new AbortController();
+	scripts.push({ teardown: 300 });
+	const answer = await call([ask], controller.signal).result();
+	const state = __test.getSharedSession("pi");
+	controller.abort();
+	await flushed();
+	assert.equal(answer.stopReason, "stop");
+	assert.strictEqual(__test.getSharedSession("pi"), state, "no second commit, no dirty abort snapshot");
+	assert.equal(state.dirtyTail, false);
+	assert.deepEqual(persisted(), stored(state));
 });

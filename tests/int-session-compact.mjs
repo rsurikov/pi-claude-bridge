@@ -40,6 +40,15 @@ try {
 	console.log("Turn 3: more history...");
 	await promptAndWait("Now pick a fruit. Reply with just the fruit. Do not use the memory system.");
 
+	// pi gets each turn at its result; the CLI writes its exit records (last-prompt,
+	// cost-state) to the transcript a moment later. Snapshot after it has exited.
+	for (const deadline = Date.now() + 15_000; ;) {
+		const log = readFileSync(DEBUG_LOG, "utf8");
+		const count = (marker) => log.split(marker).length - 1;
+		if (count("provider: Claude Code exited") >= count("syncResult:")) break;
+		if (Date.now() > deadline) throw new Error("turn 3's Claude Code never exited");
+		await new Promise((r) => setTimeout(r, 100));
+	}
 	const beforeLog = readFileSync(DEBUG_LOG, "utf8");
 	const preCompactSessionId = [...beforeLog.matchAll(/syncResult: path=[a-z-]+ sessionId=([a-f0-9-]+)/g)].at(-1)?.[1];
 	assert.ok(preCompactSessionId, "no pre-compact sessionId found");
